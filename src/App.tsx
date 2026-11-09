@@ -6,6 +6,7 @@ import { Html5QrcodeScanner } from 'html5-qrcode';
 import QRCode from 'qrcode';
 import { toast, Toaster } from 'react-hot-toast';
 import { useGym } from './context/GymContext';
+import { isFirebaseConfigured } from './lib/firebase';
 import { getIndiaDateKey, getRecentIndiaDateKeys } from './lib/dates';
 import { getCurrentMembershipStatus } from './lib/membership';
 import type { GymSettings, Member, PaymentRecord } from './types';
@@ -49,30 +50,32 @@ const statusColors: Record<string, string> = {
 };
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
-  const { isAuthenticated } = useGym();
+  const { isAuthenticated, isAuthReady } = useGym();
+  if (!isAuthReady) {
+    return <div className="flex min-h-screen items-center justify-center bg-[#04070d] text-zinc-400">Checking Firebase session…</div>;
+  }
   return isAuthenticated ? children : <Navigate to="/login" replace />;
 }
 
 function LoginPage() {
   const navigate = useNavigate();
   const { login } = useGym();
-  const [email, setEmail] = useState('admin@gym.com');
-  const [password, setPassword] = useState('admin123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoading(true);
-    const success = await login(email, password);
-    setLoading(false);
-
-    if (success) {
+    try {
+      await login(email, password);
       toast.success('Login successful');
       navigate('/dashboard');
-      return;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to sign in to Firebase.');
+    } finally {
+      setLoading(false);
     }
-
-    toast.error('Invalid admin credentials.');
   }
 
   return (
@@ -101,16 +104,21 @@ function LoginPage() {
           </button>
         </form>
 
-        <div className="mt-6 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3 text-xs text-emerald-200">
-          Demo admin credentials: admin@gym.com / admin123
-        </div>
+        <p className="mt-5 text-center text-xs text-zinc-500">
+          Sign in with the admin account created in Firebase Authentication.
+        </p>
+        {!isFirebaseConfigured && (
+          <p className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-200">
+            Firebase configuration is missing. Add your project settings to .env.local and restart the app.
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
 function AppShell() {
-  const { state, logout } = useGym();
+  const { state, logout, dataError } = useGym();
   const navigate = useNavigate();
 
   const handleLogout = async () => {
@@ -159,6 +167,12 @@ function AppShell() {
               </div>
             </div>
           </header>
+
+          {dataError && (
+            <div role="alert" className="mb-5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+              Firebase data sync error: {dataError}
+            </div>
+          )}
 
           <Routes>
             <Route path="/dashboard" element={<DashboardPage />} />
@@ -406,10 +420,14 @@ function MembersPage() {
               <button
                 type="button"
                 aria-label={`Delete ${member.fullName}`}
-                onClick={() => {
+                onClick={async () => {
                   if (window.confirm(`Delete ${member.fullName}? Their attendance and payment history will be retained.`)) {
-                    removeMember(member.id);
-                    toast.success('Member deleted. Financial and attendance history was retained.');
+                    try {
+                      await removeMember(member.id);
+                      toast.success('Member deleted. Financial and attendance history was retained.');
+                    } catch (error) {
+                      toast.error(error instanceof Error ? error.message : 'Unable to delete member.');
+                    }
                   }
                 }}
                 className="rounded-xl border border-rose-500/30 p-2 text-rose-300 hover:bg-rose-500/10"
@@ -435,48 +453,75 @@ function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
   const navigate = useNavigate();
   const existing = state.members.find((member) => member.id === id);
 
-  const [form, setForm] = useState<Member>({
-    id: existing?.id ?? `member-${Date.now()}`,
-    memberId: existing?.memberId ?? `GYM${String(state.members.length + 1).padStart(4, '0')}`,
-    fullName: existing?.fullName ?? '',
-    mobile: existing?.mobile ?? '',
-    email: existing?.email ?? '',
-    gender: existing?.gender ?? 'Male',
-    membershipPlanId: existing?.membershipPlanId ?? state.plans[0]?.id ?? '',
-    joiningDate: existing?.joiningDate ?? new Date().toISOString(),
-    membershipStartDate: existing?.membershipStartDate ?? new Date().toISOString(),
-    membershipExpiryDate: existing?.membershipExpiryDate ?? new Date(Date.now() + 30 * 86400000).toISOString(),
-    membershipFee: existing?.membershipFee ?? 0,
-    discount: existing?.discount ?? 0,
-    finalPayable: existing?.finalPayable ?? 0,
-    initialPaymentStatus: existing?.initialPaymentStatus ?? 'Pending',
-    paymentMethod: existing?.paymentMethod ?? 'Cash',
-    notes: existing?.notes ?? '',
-    status: existing?.status ?? 'Active',
-    qrToken: existing?.qrToken ?? `token-${Date.now()}`,
-    isActive: existing?.isActive ?? true,
-    createdAt: existing?.createdAt ?? new Date().toISOString(),
-    lastVisit: existing?.lastVisit,
-    totalVisits: existing?.totalVisits ?? 0,
-    totalAmountPaid: existing?.totalAmountPaid ?? 0,
-    outstandingBalance: existing?.outstandingBalance ?? 0,
-    age: existing?.age ?? 25,
-    address: existing?.address ?? '',
-    emergencyContact: existing?.emergencyContact ?? '',
-    dob: existing?.dob ?? '',
-    photoUrl: existing?.photoUrl ?? '',
+  const createMemberForm = (member?: Member): Member => ({
+    id: member?.id ?? `member-${Date.now()}`,
+    memberId: member?.memberId ?? `GYM${String(state.members.length + 1).padStart(4, '0')}`,
+    fullName: member?.fullName ?? '',
+    mobile: member?.mobile ?? '',
+    email: member?.email ?? '',
+    gender: member?.gender ?? 'Male',
+    membershipPlanId: member?.membershipPlanId ?? state.plans[0]?.id ?? '',
+    joiningDate: member?.joiningDate ?? new Date().toISOString(),
+    membershipStartDate: member?.membershipStartDate ?? new Date().toISOString(),
+    membershipExpiryDate: member?.membershipExpiryDate ?? new Date(Date.now() + 30 * 86400000).toISOString(),
+    membershipFee: member?.membershipFee ?? 0,
+    discount: member?.discount ?? 0,
+    finalPayable: member?.finalPayable ?? 0,
+    initialPaymentStatus: member?.initialPaymentStatus ?? 'Pending',
+    paymentMethod: member?.paymentMethod ?? 'Cash',
+    notes: member?.notes ?? '',
+    status: member?.status ?? 'Active',
+    qrToken: member?.qrToken ?? `token-${Date.now()}`,
+    isActive: member?.isActive ?? true,
+    createdAt: member?.createdAt ?? new Date().toISOString(),
+    lastVisit: member?.lastVisit,
+    totalVisits: member?.totalVisits ?? 0,
+    totalAmountPaid: member?.totalAmountPaid ?? 0,
+    outstandingBalance: member?.outstandingBalance ?? 0,
+    age: member?.age ?? 25,
+    address: member?.address ?? '',
+    emergencyContact: member?.emergencyContact ?? '',
+    dob: member?.dob ?? '',
+    photoUrl: member?.photoUrl ?? '',
   });
+  const [form, setForm] = useState<Member>(() => createMemberForm(existing));
 
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault();
-    if (mode === 'add') {
-      addMember({ ...form, id: `member-${Date.now()}` });
-      toast.success('Member added successfully');
-    } else {
-      updateMember(form);
-      toast.success('Member updated successfully');
+  useEffect(() => {
+    if (mode === 'edit' && existing && form.id !== existing.id) {
+      setForm(createMemberForm(existing));
     }
-    navigate('/members');
+  }, [existing, form.id, mode]);
+
+  useEffect(() => {
+    if (mode !== 'add' || form.membershipPlanId || state.plans.length === 0) return;
+    const plan = state.plans[0];
+    setForm((current) => ({
+      ...current,
+      membershipPlanId: plan.id,
+      membershipFee: plan.price,
+      finalPayable: Math.max(plan.price - current.discount, 0),
+      membershipExpiryDate: addMonthsToDate(current.membershipStartDate, plan.durationMonths),
+    }));
+  }, [form.membershipPlanId, form.membershipStartDate, mode, state.plans]);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!form.membershipPlanId || (mode === 'add' && !state.plans.some((plan) => plan.id === form.membershipPlanId))) {
+      toast.error('Select an available membership plan before saving.');
+      return;
+    }
+    try {
+      if (mode === 'add') {
+        await addMember({ ...form, id: `member-${Date.now()}` });
+        toast.success('Member added successfully');
+      } else {
+        await updateMember(form);
+        toast.success('Member updated successfully');
+      }
+      navigate('/members');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to save member.');
+    }
   };
 
   const fieldLabel = (label: string, required = false) => (
@@ -513,6 +558,10 @@ function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
             <option value="Female">Female</option>
             <option value="Other">Other</option>
           </select>
+        </div>
+        <div>
+          {fieldLabel('Age')}
+          <input value={form.age ?? ''} onChange={(e) => setForm({ ...form, age: e.target.value === '' ? undefined : Number(e.target.value) })} className="w-full rounded-xl border border-white/10 bg-[#0b1119] p-3 text-white" type="number" min="0" max="120" placeholder="Enter age" />
         </div>
         <div>
           {fieldLabel('Emergency Contact')}
@@ -616,11 +665,15 @@ function MemberDetailPage() {
             <a href={`/members/${member.id}/edit`} className="rounded-xl border border-white/10 px-4 py-2 text-sm text-zinc-200">Edit</a>
             <button
               type="button"
-              onClick={() => {
+              onClick={async () => {
                 if (window.confirm(`Delete ${member.fullName}? Their attendance and payment history will be retained.`)) {
-                  removeMember(member.id);
-                  toast.success('Member deleted. Financial and attendance history was retained.');
-                  navigate('/members');
+                  try {
+                    await removeMember(member.id);
+                    toast.success('Member deleted. Financial and attendance history was retained.');
+                    navigate('/members');
+                  } catch (error) {
+                    toast.error(error instanceof Error ? error.message : 'Unable to delete member.');
+                  }
                 }
               }}
               className="rounded-xl border border-rose-500/30 px-4 py-2 text-sm text-rose-300 hover:bg-rose-500/10"
@@ -637,6 +690,7 @@ function MemberDetailPage() {
           <h3 className="mb-4 text-lg font-semibold text-white">Membership details</h3>
           <div className="grid gap-4 md:grid-cols-2">
             <div><p className="text-xs uppercase tracking-[0.15em] text-zinc-500">Plan</p><p className="text-white">{membershipPlan?.name ?? 'Plan unavailable'}</p></div>
+            <div><p className="text-xs uppercase tracking-[0.15em] text-zinc-500">Age</p><p className="text-white">{member.age != null ? `${member.age} years` : 'Not provided'}</p></div>
             <div><p className="text-xs uppercase tracking-[0.15em] text-zinc-500">Expiry</p><p className="text-white">{formatDate(member.membershipExpiryDate)}</p></div>
             <div><p className="text-xs uppercase tracking-[0.15em] text-zinc-500">Fee</p><p className="text-white">{formatCurrency(member.membershipFee)}</p></div>
             <div><p className="text-xs uppercase tracking-[0.15em] text-zinc-500">Total paid</p><p className="text-white">{formatCurrency(member.totalAmountPaid)}</p></div>
@@ -682,7 +736,7 @@ function AttendancePage() {
   const [manualId, setManualId] = useState('');
   const [scannerReady, setScannerReady] = useState(false);
 
-  const attemptCheckIn = (member: Member, method: 'QR' | 'Manual') => {
+  const attemptCheckIn = async (member: Member, method: 'QR' | 'Manual') => {
     const todayKey = getIndiaDateKey(new Date());
     const alreadyCheckedInToday = state.attendance.some(
       (item) => item.memberId === member.id && getIndiaDateKey(new Date(item.scannedAt)) === todayKey,
@@ -694,12 +748,18 @@ function AttendancePage() {
     }
 
     const time = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
-    const success = addAttendance({
-      memberId: member.id,
-      memberName: member.fullName,
-      checkInTime: time,
-      method,
-    });
+    let success: boolean;
+    try {
+      success = await addAttendance({
+        memberId: member.id,
+        memberName: member.fullName,
+        checkInTime: time,
+        method,
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to save attendance.');
+      return;
+    }
 
     if (!success) {
       toast.error(`${member.fullName} attendance already marked for today.`);
@@ -722,7 +782,7 @@ function AttendancePage() {
           return;
         }
 
-        attemptCheckIn(member, 'QR');
+        void attemptCheckIn(member, 'QR');
       },
       () => undefined,
     );
@@ -739,7 +799,7 @@ function AttendancePage() {
       return;
     }
 
-    attemptCheckIn(member, 'Manual');
+    void attemptCheckIn(member, 'Manual');
   };
 
   return (
@@ -788,21 +848,25 @@ function MembershipsPage() {
   const [duration, setDuration] = useState('');
   const [price, setPrice] = useState('');
 
-  const handleSubmit = (event: React.FormEvent) => {
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    addPlan({
-      id: `plan-${Date.now()}`,
-      name: name.trim(),
-      durationMonths: Number(duration),
-      price: Number(price),
-      description: `Custom ${duration}-month membership plan`,
-      active: true,
-      createdAt: new Date().toISOString(),
-    });
-    toast.success('Membership plan created');
-    setName('');
-    setDuration('');
-    setPrice('');
+    try {
+      await addPlan({
+        id: `plan-${Date.now()}`,
+        name: name.trim(),
+        durationMonths: Number(duration),
+        price: Number(price),
+        description: `Custom ${duration}-month membership plan`,
+        active: true,
+        createdAt: new Date().toISOString(),
+      });
+      toast.success('Membership plan created');
+      setName('');
+      setDuration('');
+      setPrice('');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to save membership plan.');
+    }
   };
 
   return (
@@ -820,10 +884,14 @@ function MembershipsPage() {
               <p className="mt-2 text-sm text-zinc-400">{plan.durationMonths} month plan</p>
               <button
                 type="button"
-                onClick={() => {
+                onClick={async () => {
                   if (window.confirm(`Delete the "${plan.name}" plan? Existing members will keep their saved membership details.`)) {
-                    removePlan(plan.id);
-                    toast.success('Membership plan deleted');
+                    try {
+                      await removePlan(plan.id);
+                      toast.success('Membership plan deleted');
+                    } catch (error) {
+                      toast.error(error instanceof Error ? error.message : 'Unable to delete membership plan.');
+                    }
                   }
                 }}
                 className="mt-4 inline-flex items-center gap-2 rounded-lg border border-rose-500/30 px-3 py-2 text-sm text-rose-300 hover:bg-rose-500/10"
@@ -921,7 +989,7 @@ function PaymentsPage() {
     return query.length > 0 && `${member.fullName} ${member.mobile} ${member.memberId}`.toLowerCase().includes(query);
   }).slice(0, 8);
 
-  const handleSubmit = (event: React.FormEvent) => {
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     const member = state.members.find((item) => item.id === selectedMemberId);
     if (!member) {
@@ -965,7 +1033,12 @@ function PaymentsPage() {
       paymentMethod: method,
     };
 
-    recordPayment(payment, updatedMember);
+    try {
+      await recordPayment(payment, updatedMember);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to save payment.');
+      return;
+    }
     toast.success(`Payment recorded for ${member.fullName}; membership extended to ${formatDate(membershipExpiryDate)}.`);
     setMemberSearch('');
     setSelectedMemberId('');
@@ -1189,10 +1262,18 @@ function SettingsPage() {
   const { state, setSettings } = useGym();
   const [form, setForm] = useState<GymSettings>(state.settings);
 
-  const save = (event: React.FormEvent) => {
+  useEffect(() => {
+    setForm(state.settings);
+  }, [state.settings]);
+
+  const save = async (event: React.FormEvent) => {
     event.preventDefault();
-    setSettings(form);
-    toast.success('Settings saved');
+    try {
+      await setSettings(form);
+      toast.success('Settings saved');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to save settings.');
+    }
   };
 
   return (

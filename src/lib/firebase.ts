@@ -1,6 +1,6 @@
 import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, signInWithEmailAndPassword, signOut, type User } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { getDatabase } from 'firebase/database';
 import { getStorage } from 'firebase/storage';
 
 const firebaseConfig = {
@@ -10,23 +10,29 @@ const firebaseConfig = {
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || '',
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '',
   appId: import.meta.env.VITE_FIREBASE_APP_ID || '',
+  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL || '',
 };
 
-export const isFirebaseConfigured = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
+export const isFirebaseConfigured = Boolean(
+  firebaseConfig.apiKey
+  && firebaseConfig.authDomain
+  && firebaseConfig.projectId
+  && firebaseConfig.databaseURL
+  && firebaseConfig.storageBucket
+  && firebaseConfig.messagingSenderId
+  && firebaseConfig.appId,
+);
 
-export const firebaseApp = isFirebaseConfigured ? getApps().length ? getApps()[0] : initializeApp(firebaseConfig) : null;
+export const firebaseApp = isFirebaseConfigured
+  ? getApps().length ? getApps()[0] : initializeApp(firebaseConfig)
+  : null;
 export const auth = firebaseApp ? getAuth(firebaseApp) : null;
-export const db = firebaseApp ? getFirestore(firebaseApp) : null;
+export const database = firebaseApp ? getDatabase(firebaseApp) : null;
 export const storage = firebaseApp ? getStorage(firebaseApp) : null;
 
-export const adminCredentials = {
-  email: import.meta.env.VITE_ADMIN_EMAIL || 'admin@gym.com',
-  password: import.meta.env.VITE_ADMIN_PASSWORD || 'admin123',
-};
-
-export const loginWithFirebase = async (email: string, password: string) => {
+export const loginWithFirebase = async (email: string, password: string): Promise<User> => {
   if (!auth) {
-    throw new Error('Firebase is not configured. Using local demo mode.');
+    throw new Error('Firebase is not configured. Add the project settings to .env.local and restart the app.');
   }
 
   const result = await signInWithEmailAndPassword(auth, email, password);
@@ -34,8 +40,6 @@ export const loginWithFirebase = async (email: string, password: string) => {
 };
 
 export const logoutFromFirebase = async () => {
-  if (!auth) return;
+  if (!auth) throw new Error('Firebase is not configured.');
   await signOut(auth);
 };
-
-export const getCurrentUser = (): User | null => auth?.currentUser ?? null;

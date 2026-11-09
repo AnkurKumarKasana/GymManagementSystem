@@ -1,12 +1,11 @@
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { adminCredentials, isFirebaseConfigured, loginWithFirebase, logoutFromFirebase } from '../lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
+import { onValue, ref, remove, runTransaction, set, update } from 'firebase/database';
+import { auth, database, isFirebaseConfigured, loginWithFirebase, logoutFromFirebase } from '../lib/firebase';
 import { getIndiaDateKey } from '../lib/dates';
 import { getCurrentMembershipStatus } from '../lib/membership';
-import type { Activity, GymState, Member, PaymentRecord, Plan, GymSettings } from '../types';
-
-const STORAGE_KEY = 'elite-edge-gym-state';
-const AUTH_KEY = 'elite-edge-gym-auth';
+import type { Activity, AttendanceRecord, GymState, Member, PaymentRecord, Plan, GymSettings } from '../types';
 
 const defaultSettings: GymSettings = {
   gymName: '',
@@ -29,54 +28,30 @@ const createEmptyState = (): GymState => ({
   activities: [],
 });
 
-const loadState = (): GymState => {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved) as Partial<GymState>;
-      const demoMemberIds = new Set(['member-1', 'member-2', 'member-3']);
-      const demoPlanIds = new Set(['plan-1', 'plan-2', 'plan-3', 'plan-4']);
-      const demoPlanNames = new Set(['1 month', '3 months', '6 months', '12 months']);
-      const members = (parsed.members ?? []).filter((member) => !demoMemberIds.has(member.id));
-      const settings = { ...defaultSettings, ...(parsed.settings ?? {}) };
-      if (settings.gymName === 'EliteEdge Gym') {
-        settings.gymName = '';
-        settings.address = '';
-        settings.contactNumber = '';
-        settings.email = '';
-      }
-
-      return {
-        members,
-        plans: (parsed.plans ?? []).filter((plan) => !demoPlanIds.has(plan.id) && !demoPlanNames.has(plan.name.trim().toLowerCase())),
-        attendance: (parsed.attendance ?? []).filter((record) => !demoMemberIds.has(record.memberId)),
-        payments: (parsed.payments ?? []).filter((payment) => !demoMemberIds.has(payment.memberId)),
-        settings,
-        activities: (parsed.activities ?? []).filter((activity) => !/Ananya Kapoor|Rahul Sharma|Neha Verma/i.test(activity.title)),
-      };
-    }
-  } catch {
-    // Ignore parse errors and use defaults.
-  }
-
-  return createEmptyState();
+type GymData = {
+  members?: Record<string, Member>;
+  plans?: Record<string, Plan>;
+  attendance?: Record<string, AttendanceRecord>;
+  payments?: Record<string, PaymentRecord>;
+  activities?: Record<string, Activity>;
+  settings?: Partial<GymSettings>;
 };
 
 type GymContextValue = {
   state: GymState;
   isAuthenticated: boolean;
-  login: (email: string, password: string) => Promise<boolean>;
+  isAuthReady: boolean;
+  dataError: string;
+  login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-  addMember: (member: Member) => void;
-  updateMember: (member: Member) => void;
-  removeMember: (memberId: string) => void;
-  addPlan: (plan: Plan) => void;
-  removePlan: (planId: string) => void;
-  setSettings: (settings: GymSettings) => void;
-  addPayment: (payment: PaymentRecord) => void;
-  recordPayment: (payment: PaymentRecord, updatedMember: Member) => void;
-  addAttendance: (record: { memberId: string; memberName: string; checkInTime: string; method?: 'QR' | 'Manual'; }) => boolean;
-  addActivity: (activity: Activity) => void;
+  addMember: (member: Member) => Promise<void>;
+  updateMember: (member: Member) => Promise<void>;
+  removeMember: (memberId: string) => Promise<void>;
+  addPlan: (plan: Plan) => Promise<void>;
+  removePlan: (planId: string) => Promise<void>;
+  setSettings: (settings: GymSettings) => Promise<void>;
+  recordPayment: (payment: PaymentRecord, updatedMember: Member) => Promise<void>;
+  addAttendance: (record: { memberId: string; memberName: string; checkInTime: string; method?: 'QR' | 'Manual'; }) => Promise<boolean>;
   stats: {
     totalMembers: number;
     activeMembers: number;
@@ -87,135 +62,174 @@ type GymContextValue = {
     pendingPayments: number;
     totalRevenue: number;
   };
-  refreshFromStorage: () => void;
 };
 
 const GymContext = createContext<GymContextValue | undefined>(undefined);
 
+function getGymPath(userId: string, path = '') {
+  return `gyms/${userId}${path ? `/${path}` : ''}`;
+}
+
+function getGymRef(userId: string, path = '') {
+  if (!database) {
+    throw new Error('Firebase Realtime Database is not configured. Check .env.local and restart the app.');
+  }
+  return ref(database, getGymPath(userId, path));
+}
+
+function valuesOf<T extends { id?: string }>(value?: Record<string, T>): T[] {
+  if (!value) return [];
+  return Object.entries(value).map(([id, item]) => ({ ...item, id: item.id ?? id }));
+}
+
+function omitUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => omitUndefined(item)) as T;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .map(([key, item]) => [key, omitUndefined(item)]);
+    return Object.fromEntries(entries) as T;
+  }
+  return value;
+}
+
+function getFirebaseErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return 'An unexpected Firebase error occurred.';
+}
+
 export function GymProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<GymState>(() => loadState());
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    const saved = localStorage.getItem(AUTH_KEY);
-    return saved === 'true';
-  });
+  const [state, setState] = useState<GymState>(createEmptyState);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(!isFirebaseConfigured);
+  const [dataError, setDataError] = useState('');
 
-  const saveToStorage = useCallback((nextState: GymState) => {
-    setState(nextState);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
+  useEffect(() => {
+    if (!auth) {
+      setIsAuthReady(true);
+      setUserId(null);
+      return;
+    }
+
+    return onAuthStateChanged(auth, (user) => {
+      setUserId(user?.uid ?? null);
+      setIsAuthReady(true);
+      if (!user) {
+        setState(createEmptyState());
+        setDataError('');
+      }
+    }, (error) => {
+      setDataError(getFirebaseErrorMessage(error));
+      setIsAuthReady(true);
+    });
   }, []);
 
-  const refreshFromStorage = useCallback(() => {
-    setState(loadState());
-  }, []);
+  useEffect(() => {
+    if (!userId || !database) {
+      setState(createEmptyState());
+      return;
+    }
+
+    setDataError('');
+    return onValue(getGymRef(userId), (snapshot) => {
+      const data = (snapshot.val() ?? {}) as GymData;
+      setState({
+        members: valuesOf(data.members),
+        plans: valuesOf(data.plans),
+        attendance: valuesOf(data.attendance).sort((left, right) => right.scannedAt.localeCompare(left.scannedAt)),
+        payments: valuesOf(data.payments).sort((left, right) => right.paymentDate.localeCompare(left.paymentDate)),
+        activities: valuesOf(data.activities).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 12),
+        settings: { ...defaultSettings, ...(data.settings ?? {}) },
+      });
+    }, (error) => {
+      setDataError(getFirebaseErrorMessage(error));
+    });
+  }, [userId]);
+
+  const requireUserId = useCallback(() => {
+    if (!database || !userId) throw new Error('Sign in before saving gym data.');
+    return userId;
+  }, [userId]);
 
   const login = useCallback(async (email: string, password: string) => {
-    try {
-      if (!isFirebaseConfigured) {
-        const valid = email === adminCredentials.email && password === adminCredentials.password;
-        if (!valid) return false;
-        localStorage.setItem(AUTH_KEY, 'true');
-        setIsAuthenticated(true);
-        return true;
-      }
-
-      await loginWithFirebase(email, password);
-      localStorage.setItem(AUTH_KEY, 'true');
-      setIsAuthenticated(true);
-      return true;
-    } catch {
-      return false;
+    if (!isFirebaseConfigured) {
+      throw new Error('Firebase is not configured. Check .env.local and restart the app.');
     }
+    const user = await loginWithFirebase(email, password);
+    setUserId(user.uid);
   }, []);
 
   const logout = useCallback(async () => {
-    try {
-      if (isFirebaseConfigured) {
-        await logoutFromFirebase();
-      }
-    } finally {
-      localStorage.removeItem(AUTH_KEY);
-      setIsAuthenticated(false);
-    }
+    await logoutFromFirebase();
   }, []);
 
-  const addMember = useCallback((member: Member) => {
-    const nextState = { ...state, members: [member, ...state.members] };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
+  const addMember = useCallback(async (member: Member) => {
+    const currentUserId = requireUserId();
+    await set(getGymRef(currentUserId, `members/${member.id}`), omitUndefined(member));
+  }, [requireUserId]);
 
-  const updateMember = useCallback((updatedMember: Member) => {
-    const nextState = {
-      ...state,
-      members: state.members.map((member) => (member.id === updatedMember.id ? updatedMember : member)),
+  const updateMember = useCallback(async (member: Member) => {
+    const currentUserId = requireUserId();
+    await set(getGymRef(currentUserId, `members/${member.id}`), omitUndefined(member));
+  }, [requireUserId]);
+
+  const removeMember = useCallback(async (memberId: string) => {
+    const currentUserId = requireUserId();
+    await remove(getGymRef(currentUserId, `members/${memberId}`));
+  }, [requireUserId]);
+
+  const addPlan = useCallback(async (plan: Plan) => {
+    const currentUserId = requireUserId();
+    await set(getGymRef(currentUserId, `plans/${plan.id}`), plan);
+  }, [requireUserId]);
+
+  const removePlan = useCallback(async (planId: string) => {
+    const currentUserId = requireUserId();
+    await remove(getGymRef(currentUserId, `plans/${planId}`));
+  }, [requireUserId]);
+
+  const setSettings = useCallback(async (settings: GymSettings) => {
+    const currentUserId = requireUserId();
+    await set(getGymRef(currentUserId, 'settings'), settings);
+  }, [requireUserId]);
+
+  const recordPayment = useCallback(async (payment: PaymentRecord, updatedMember: Member) => {
+    const currentUserId = requireUserId();
+    const activity: Activity = {
+      id: `activity-${payment.id}`,
+      type: 'payment',
+      title: `Payment recorded for ${updatedMember.fullName}`,
+      createdAt: payment.paymentDate,
     };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
+    await update(getGymRef(currentUserId), omitUndefined({
+      [`payments/${payment.id}`]: payment,
+      [`members/${updatedMember.id}`]: updatedMember,
+      [`activities/${activity.id}`]: activity,
+    }));
+  }, [requireUserId]);
 
-  const removeMember = useCallback((memberId: string) => {
-    const nextState = { ...state, members: state.members.filter((member) => member.id !== memberId) };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const addPlan = useCallback((plan: Plan) => {
-    const nextState = { ...state, plans: [plan, ...state.plans] };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const removePlan = useCallback((planId: string) => {
-    const nextState = { ...state, plans: state.plans.filter((plan) => plan.id !== planId) };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const setSettings = useCallback((settings: GymSettings) => {
-    const nextState = { ...state, settings };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const addPayment = useCallback((payment: PaymentRecord) => {
-    const nextState = { ...state, payments: [payment, ...state.payments] };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const recordPayment = useCallback((payment: PaymentRecord, updatedMember: Member) => {
-    const nextState = {
-      ...state,
-      members: state.members.map((member) => member.id === updatedMember.id ? updatedMember : member),
-      payments: [payment, ...state.payments],
-      activities: [{
-        id: `activity-${payment.id}`,
-        type: 'payment' as const,
-        title: `Payment recorded for ${updatedMember.fullName}`,
-        createdAt: payment.paymentDate,
-      }, ...state.activities].slice(0, 12),
-    };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
-
-  const addAttendance = useCallback((record: { memberId: string; memberName: string; checkInTime: string; method?: 'QR' | 'Manual'; }) => {
-    const todayKey = getIndiaDateKey(new Date());
-    const hasCheckedInToday = state.attendance.some((item) => item.memberId === record.memberId && getIndiaDateKey(new Date(item.scannedAt)) === todayKey);
-    if (hasCheckedInToday) {
-      return false;
-    }
-
-    const nextAttendance = {
-      id: `att-${Date.now()}`,
+  const addAttendance = useCallback(async (record: { memberId: string; memberName: string; checkInTime: string; method?: 'QR' | 'Manual'; }) => {
+    const currentUserId = requireUserId();
+    const now = new Date();
+    const dateKey = getIndiaDateKey(now);
+    const attendanceId = `${record.memberId}_${dateKey}`;
+    const attendance: AttendanceRecord = {
+      id: attendanceId,
       memberId: record.memberId,
       memberName: record.memberName,
-      scannedAt: new Date().toISOString(),
+      scannedAt: now.toISOString(),
       checkInTime: record.checkInTime,
       method: record.method ?? 'QR',
     };
 
-    const nextState = { ...state, attendance: [nextAttendance, ...state.attendance] };
-    saveToStorage(nextState);
-    return true;
-  }, [saveToStorage, state]);
-
-  const addActivity = useCallback((activity: Activity) => {
-    const nextState = { ...state, activities: [activity, ...state.activities].slice(0, 12) };
-    saveToStorage(nextState);
-  }, [saveToStorage, state]);
+    const result = await runTransaction(getGymRef(currentUserId, `attendance/${attendanceId}`), (existing) => {
+      if (existing !== null) return;
+      return omitUndefined(attendance);
+    });
+    return result.committed;
+  }, [requireUserId]);
 
   const stats = useMemo(() => {
     const todayKey = getIndiaDateKey(new Date());
@@ -223,10 +237,13 @@ export function GymProvider({ children }: { children: ReactNode }) {
     const expiredMembers = state.members.filter((member) => getCurrentMembershipStatus(member, todayKey) === 'Expired').length;
     const expiringSoon = state.members.filter((member) => getCurrentMembershipStatus(member, todayKey) === 'Expiring Soon').length;
     const todayAttendance = state.attendance.filter((item) => getIndiaDateKey(new Date(item.scannedAt)) === todayKey).length;
+    const currentMonth = todayKey.slice(0, 7);
     const monthlyRevenue = state.payments
-      .filter((payment) => new Date(payment.paymentDate).getMonth() === new Date().getMonth())
+      .filter((payment) => getIndiaDateKey(new Date(payment.paymentDate)).slice(0, 7) === currentMonth)
       .reduce((sum, payment) => sum + payment.amountPaid, 0);
-    const pendingPayments = state.payments.filter((payment) => payment.paymentStatus === 'Pending' || payment.paymentStatus === 'Partially Paid').reduce((sum, payment) => sum + payment.remainingBalance, 0);
+    const pendingPayments = state.payments
+      .filter((payment) => payment.paymentStatus === 'Pending' || payment.paymentStatus === 'Partially Paid')
+      .reduce((sum, payment) => sum + payment.remainingBalance, 0);
     const totalRevenue = state.payments.reduce((sum, payment) => sum + payment.amountPaid, 0);
 
     return {
@@ -241,11 +258,28 @@ export function GymProvider({ children }: { children: ReactNode }) {
     };
   }, [state]);
 
-  return (
-    <GymContext.Provider value={{ state, isAuthenticated, login, logout, addMember, updateMember, removeMember, addPlan, removePlan, setSettings, addPayment, recordPayment, addAttendance, addActivity, stats, refreshFromStorage }}>
-      {children}
-    </GymContext.Provider>
-  );
+  const value = useMemo(() => ({
+    state,
+    isAuthenticated: Boolean(userId),
+    isAuthReady,
+    dataError,
+    login,
+    logout,
+    addMember,
+    updateMember,
+    removeMember,
+    addPlan,
+    removePlan,
+    setSettings,
+    recordPayment,
+    addAttendance,
+    stats,
+  }), [
+    state, userId, isAuthReady, dataError, login, logout, addMember, updateMember,
+    removeMember, addPlan, removePlan, setSettings, recordPayment, addAttendance, stats,
+  ]);
+
+  return <GymContext.Provider value={value}>{children}</GymContext.Provider>;
 }
 
 export function useGym() {
