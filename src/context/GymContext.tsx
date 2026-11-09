@@ -1,8 +1,9 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
-import { onValue, ref, remove, runTransaction, set, update } from 'firebase/database';
-import { auth, database, isFirebaseConfigured, loginWithFirebase, logoutFromFirebase } from '../lib/firebase';
+import { get, onValue, ref, remove, runTransaction, set, update } from 'firebase/database';
+import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
+import { auth, database, isFirebaseConfigured, loginWithFirebase, logoutFromFirebase, storage } from '../lib/firebase';
 import { getIndiaDateKey } from '../lib/dates';
 import { getCurrentMembershipStatus } from '../lib/membership';
 import type { Activity, AttendanceRecord, GymState, Member, PaymentRecord, Plan, GymSettings } from '../types';
@@ -46,6 +47,7 @@ type GymContextValue = {
   logout: () => Promise<void>;
   addMember: (member: Member) => Promise<void>;
   updateMember: (member: Member) => Promise<void>;
+  uploadMemberPhoto: (memberId: string, file: File) => Promise<string>;
   removeMember: (memberId: string) => Promise<void>;
   addPlan: (plan: Plan) => Promise<void>;
   removePlan: (planId: string) => Promise<void>;
@@ -82,6 +84,31 @@ function valuesOf<T extends { id?: string }>(value?: Record<string, T>): T[] {
   return Object.entries(value).map(([id, item]) => ({ ...item, id: item.id ?? id }));
 }
 
+function memberSequence(memberId: string): number | null {
+  const match = /^IB-(\d+)$/i.exec(memberId);
+  return match ? Number(match[1]) : null;
+}
+
+function needsMemberIdMigration(members: Record<string, Member>): boolean {
+  const seen = new Set<string>();
+  return Object.values(members).some((member) => {
+    const code = member.memberId?.toUpperCase() ?? '';
+    if (!memberSequence(code) || seen.has(code)) return true;
+    seen.add(code);
+    return false;
+  });
+}
+
+function migrateMemberIds(members: Record<string, Member>): Record<string, Member> {
+  return Object.entries(members)
+    .sort(([leftId, left], [rightId, right]) =>
+      (left.createdAt ?? '').localeCompare(right.createdAt ?? '') || leftId.localeCompare(rightId))
+    .reduce<Record<string, Member>>((migrated, [id, member], index) => {
+      migrated[id] = { ...member, id: member.id ?? id, memberId: `IB-${String(index + 1).padStart(3, '0')}` };
+      return migrated;
+    }, {});
+}
+
 function omitUndefined<T>(value: T): T {
   if (Array.isArray(value)) {
     return value.map((item) => omitUndefined(item)) as T;
@@ -105,6 +132,7 @@ export function GymProvider({ children }: { children: ReactNode }) {
   const [userId, setUserId] = useState<string | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(!isFirebaseConfigured);
   const [dataError, setDataError] = useState('');
+  const memberIdMigrationUser = useRef<string | null>(null);
 
   useEffect(() => {
     if (!auth) {
@@ -117,6 +145,7 @@ export function GymProvider({ children }: { children: ReactNode }) {
       setUserId(user?.uid ?? null);
       setIsAuthReady(true);
       if (!user) {
+        memberIdMigrationUser.current = null;
         setState(createEmptyState());
         setDataError('');
       }
@@ -143,6 +172,19 @@ export function GymProvider({ children }: { children: ReactNode }) {
         activities: valuesOf(data.activities).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 12),
         settings: { ...defaultSettings, ...(data.settings ?? {}) },
       });
+
+      if (memberIdMigrationUser.current !== userId) {
+        memberIdMigrationUser.current = userId;
+        if (data.members && needsMemberIdMigration(data.members)) {
+          void runTransaction(getGymRef(userId, 'members'), (members) => {
+            if (!members || typeof members !== 'object') return members;
+            const currentMembers = members as Record<string, Member>;
+            return needsMemberIdMigration(currentMembers) ? migrateMemberIds(currentMembers) : currentMembers;
+          }).catch((error: unknown) => {
+            setDataError(`Unable to update member IDs: ${getFirebaseErrorMessage(error)}`);
+          });
+        }
+      }
     }, (error) => {
       setDataError(getFirebaseErrorMessage(error));
     });
@@ -167,12 +209,34 @@ export function GymProvider({ children }: { children: ReactNode }) {
 
   const addMember = useCallback(async (member: Member) => {
     const currentUserId = requireUserId();
-    await set(getGymRef(currentUserId, `members/${member.id}`), omitUndefined(member));
+    const membersSnapshot = await get(getGymRef(currentUserId, 'members'));
+    const members = membersSnapshot.val() as Record<string, Member> | null;
+    const currentMax = Object.values(members ?? {}).reduce((max, existingMember) =>
+      Math.max(max, memberSequence(existingMember.memberId ?? '') ?? 0), 0);
+    const sequenceResult = await runTransaction(getGymRef(currentUserId, 'counters/memberId'), (current) =>
+      Math.max(typeof current === 'number' ? current : 0, currentMax) + 1);
+    if (!sequenceResult.committed) {
+      throw new Error('Unable to allocate a unique member ID. Please try again.');
+    }
+
+    const assignedMember = {
+      ...member,
+      memberId: `IB-${String(sequenceResult.snapshot.val()).padStart(3, '0')}`,
+    };
+    await set(getGymRef(currentUserId, `members/${member.id}`), omitUndefined(assignedMember));
   }, [requireUserId]);
 
   const updateMember = useCallback(async (member: Member) => {
     const currentUserId = requireUserId();
     await set(getGymRef(currentUserId, `members/${member.id}`), omitUndefined(member));
+  }, [requireUserId]);
+
+  const uploadMemberPhoto = useCallback(async (memberId: string, file: File) => {
+    const currentUserId = requireUserId();
+    if (!storage) throw new Error('Firebase Storage is not configured.');
+    const imageRef = storageRef(storage, `gyms/${currentUserId}/members/${memberId}/photo-${Date.now()}`);
+    const uploaded = await uploadBytes(imageRef, file, { contentType: file.type });
+    return getDownloadURL(uploaded.ref);
   }, [requireUserId]);
 
   const removeMember = useCallback(async (memberId: string) => {
@@ -267,6 +331,7 @@ export function GymProvider({ children }: { children: ReactNode }) {
     logout,
     addMember,
     updateMember,
+    uploadMemberPhoto,
     removeMember,
     addPlan,
     removePlan,
@@ -275,7 +340,7 @@ export function GymProvider({ children }: { children: ReactNode }) {
     addAttendance,
     stats,
   }), [
-    state, userId, isAuthReady, dataError, login, logout, addMember, updateMember,
+    state, userId, isAuthReady, dataError, login, logout, addMember, updateMember, uploadMemberPhoto,
     removeMember, addPlan, removePlan, setSettings, recordPayment, addAttendance, stats,
   ]);
 

@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { BellRing, Dumbbell, FileText, LayoutDashboard, LogOut, QrCode, Settings, ShieldCheck, Trash2, Users, WalletCards } from 'lucide-react';
 import { BarChart, Bar, Cell, LineChart, Line, PieChart, Pie, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts';
-import { Html5QrcodeScanner } from 'html5-qrcode';
+import { Html5Qrcode } from 'html5-qrcode';
 import QRCode from 'qrcode';
 import { toast, Toaster } from 'react-hot-toast';
 import { useGym } from './context/GymContext';
@@ -448,14 +448,18 @@ function MembersPage() {
 }
 
 function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
-  const { state, addMember, updateMember } = useGym();
+  const { state, addMember, updateMember, uploadMemberPhoto } = useGym();
   const { id } = useParams();
   const navigate = useNavigate();
   const existing = state.members.find((member) => member.id === id);
+  const uploadPhotoInput = useRef<HTMLInputElement>(null);
+  const capturePhotoInput = useRef<HTMLInputElement>(null);
+  const [selectedPhoto, setSelectedPhoto] = useState<File | null>(null);
+  const [photoPreview, setPhotoPreview] = useState('');
 
   const createMemberForm = (member?: Member): Member => ({
     id: member?.id ?? `member-${Date.now()}`,
-    memberId: member?.memberId ?? `GYM${String(state.members.length + 1).padStart(4, '0')}`,
+    memberId: member?.memberId ?? '',
     fullName: member?.fullName ?? '',
     mobile: member?.mobile ?? '',
     email: member?.email ?? '',
@@ -487,6 +491,17 @@ function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
   const [form, setForm] = useState<Member>(() => createMemberForm(existing));
 
   useEffect(() => {
+    if (!selectedPhoto) {
+      setPhotoPreview('');
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(selectedPhoto);
+    setPhotoPreview(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [selectedPhoto]);
+
+  useEffect(() => {
     if (mode === 'edit' && existing && form.id !== existing.id) {
       setForm(createMemberForm(existing));
     }
@@ -511,17 +526,35 @@ function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
       return;
     }
     try {
+      const memberId = mode === 'add' ? `member-${Date.now()}` : form.id;
+      const photoUrl = selectedPhoto
+        ? await uploadMemberPhoto(memberId, selectedPhoto)
+        : form.photoUrl;
+      const memberToSave = { ...form, id: memberId, photoUrl };
       if (mode === 'add') {
-        await addMember({ ...form, id: `member-${Date.now()}` });
+        await addMember(memberToSave);
         toast.success('Member added successfully');
       } else {
-        await updateMember(form);
+        await updateMember(memberToSave);
         toast.success('Member updated successfully');
       }
       navigate('/members');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Unable to save member.');
     }
+  };
+
+  const selectPhoto = (file?: File) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      toast.error('Choose a valid image file.');
+      return;
+    }
+    if (file.size >= 5 * 1024 * 1024) {
+      toast.error('Image must be smaller than 5 MB.');
+      return;
+    }
+    setSelectedPhoto(file);
   };
 
   const fieldLabel = (label: string, required = false) => (
@@ -535,6 +568,23 @@ function MemberFormPage({ mode }: { mode: 'add' | 'edit' }) {
     <div className="rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
       <h2 className="mb-4 text-2xl font-bold text-white">{mode === 'add' ? 'Add member' : 'Edit member'}</h2>
       <form onSubmit={submit} className="grid gap-5 md:grid-cols-2">
+        <div className="md:col-span-2">
+          {fieldLabel('Member Photo')}
+          <div className="flex flex-col gap-4 rounded-xl border border-white/10 bg-[#0b1119] p-4 sm:flex-row sm:items-center">
+            {(photoPreview || form.photoUrl) ? (
+              <img src={photoPreview || form.photoUrl} alt="Member preview" className="h-24 w-24 rounded-full object-cover" />
+            ) : (
+              <div className="flex h-24 w-24 items-center justify-center rounded-full bg-white/5 text-sm text-zinc-500">No photo</div>
+            )}
+            <div className="flex flex-wrap gap-3">
+              <button type="button" onClick={() => uploadPhotoInput.current?.click()} className="rounded-xl border border-white/10 px-4 py-2 text-sm text-zinc-200">Upload photo</button>
+              <button type="button" onClick={() => capturePhotoInput.current?.click()} className="rounded-xl bg-white/5 px-4 py-2 text-sm text-zinc-200">Take photo</button>
+              <input ref={uploadPhotoInput} type="file" accept="image/*" className="hidden" onChange={(event) => selectPhoto(event.target.files?.[0])} />
+              <input ref={capturePhotoInput} type="file" accept="image/*" capture="user" className="hidden" onChange={(event) => selectPhoto(event.target.files?.[0])} />
+            </div>
+          </div>
+          <p className="mt-2 text-xs text-zinc-500">Images must be smaller than 5 MB. The photo uploads when you save the member.</p>
+        </div>
         <div>
           {fieldLabel('Full Name', true)}
           <input required value={form.fullName} onChange={(e) => setForm({ ...form, fullName: e.target.value })} className="w-full rounded-xl border border-white/10 bg-[#0b1119] p-3 text-white" placeholder="Enter full name" />
@@ -655,7 +705,9 @@ function MemberDetailPage() {
       <div className="rounded-2xl border border-white/10 bg-zinc-900/80 p-6">
         <div className="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-4">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/15 text-2xl font-bold text-emerald-300">{member.fullName.slice(0, 1)}</div>
+            {member.photoUrl
+              ? <img src={member.photoUrl} alt={`${member.fullName} profile`} className="h-16 w-16 rounded-full object-cover" />
+              : <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/15 text-2xl font-bold text-emerald-300">{member.fullName.slice(0, 1)}</div>}
             <div>
               <h2 className="text-2xl font-bold text-white">{member.fullName}</h2>
               <p className="text-zinc-400">{member.memberId} • {member.mobile}</p>
@@ -735,6 +787,7 @@ function AttendancePage() {
   const { state, addAttendance } = useGym();
   const [manualId, setManualId] = useState('');
   const [scannerReady, setScannerReady] = useState(false);
+  const membersRef = useRef(state.members);
 
   const attemptCheckIn = async (member: Member, method: 'QR' | 'Manual') => {
     const todayKey = getIndiaDateKey(new Date());
@@ -769,28 +822,48 @@ function AttendancePage() {
     toast.success(`${member.fullName} checked in successfully`);
   };
 
+  membersRef.current = state.members;
+  const attemptCheckInRef = useRef(attemptCheckIn);
+  attemptCheckInRef.current = attemptCheckIn;
+
   useEffect(() => {
     if (!scannerReady) return;
 
-    const scanner = new Html5QrcodeScanner('reader', { fps: 10, qrbox: { width: 280, height: 280 } }, false);
-
-    scanner.render(
+    const scanner = new Html5Qrcode('reader');
+    let disposed = false;
+    const startPromise = scanner.start(
+      { facingMode: 'environment' },
+      { fps: 10, qrbox: { width: 280, height: 280 } },
       (result) => {
-        const member = state.members.find((item) => item.qrToken === result);
+        const member = membersRef.current.find((item) => item.qrToken === result);
         if (!member) {
           toast.error('QR code not recognized.');
           return;
         }
 
-        void attemptCheckIn(member, 'QR');
+        void attemptCheckInRef.current(member, 'QR');
       },
       () => undefined,
-    );
+    ).catch((error: unknown) => {
+      if (!disposed) {
+        const message = error instanceof Error ? error.message : 'Camera access was denied or unavailable.';
+        toast.error(`Unable to open the back camera: ${message}`);
+        setScannerReady(false);
+      }
+    });
 
     return () => {
-      scanner.clear().catch(() => undefined);
+      disposed = true;
+      void startPromise
+        .then(() => scanner.isScanning ? scanner.stop() : undefined)
+        .then(() => scanner.clear())
+        .catch((error: unknown) => {
+          if (scanner.isScanning) {
+            toast.error(error instanceof Error ? error.message : 'Unable to stop the camera scanner.');
+          }
+        });
     };
-  }, [scannerReady, state.members, state.attendance]);
+  }, [scannerReady]);
 
   const handleManualCheckin = () => {
     const member = state.members.find((item) => item.memberId.toLowerCase() === manualId.trim().toLowerCase());
@@ -820,7 +893,7 @@ function AttendancePage() {
 
           <div className="rounded-2xl border border-white/10 bg-[#0b1119] p-4">
             <label className="mb-2 block text-sm text-zinc-300">Manual member lookup</label>
-            <input value={manualId} onChange={(e) => setManualId(e.target.value)} placeholder="GYM0001" className="w-full rounded-xl border border-white/10 bg-[#04070d] px-3 py-3 text-white" />
+            <input value={manualId} onChange={(e) => setManualId(e.target.value)} placeholder="IB-001" className="w-full rounded-xl border border-white/10 bg-[#04070d] px-3 py-3 text-white" />
             <button onClick={handleManualCheckin} className="mt-4 w-full rounded-xl bg-white/5 px-4 py-3 text-sm font-semibold text-white hover:bg-white/10">Mark attendance</button>
           </div>
         </div>
